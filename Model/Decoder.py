@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 
-from transformers import (GPT2LMHeadModel,GPT2Tokenizer,)
+from transformers import (GPT2LMHeadModel, GPT2Tokenizer,)
 import torch.nn.functional as F
 
-from peft import (LoraConfig,TaskType,get_peft_model,)
+from peft import (LoraConfig, TaskType, get_peft_model,)
 MAX_TEXT_LEN = 800
 
 NORMAL_TOKEN_WEIGHT = 2.0
@@ -57,13 +57,14 @@ class GPT2Decoder(nn.Module):
             lora_dropout=0.05,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
+            fan_in_fan_out=True,   # GPT-2 uses Conv1D layers (silences the peft warning)
         )
 
         self.llm = get_peft_model(base_gpt2, peft_config)
 
         self.hidden_dim = self.llm.config.n_embd
         self.embedding = self.llm.get_input_embeddings()
-    
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -72,10 +73,10 @@ class GPT2Decoder(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor = None,
         labels: torch.Tensor = None,
-        species_mask : torch.Tensor = None,
-        image_len = 196,
-        prompt_len = 8):
-        
+        species_mask: torch.Tensor = None,
+        image_len=196,
+        prompt_len=8):
+
         device = self.device
         batch_size, text_len = species_mask.shape
         outputs = self.llm(
@@ -86,23 +87,12 @@ class GPT2Decoder(nn.Module):
 
         logits = outputs.logits
 
-        # calculate species mask        
         shift_logits = logits[:, :-1]
         shift_labels = labels[:, 1:]
-        #shift_logits = logits[:, :-1, :].contiguous()
-        #shift_labels = labels[:, 1:].contiguous()
-        
-        image_weights = torch.zeros(
-            batch_size,
-            image_len,
-            device=device,
-        )
 
-        prompt_weights = torch.zeros(
-            batch_size,
-            prompt_len,
-            device=device,
-        )
+        # Sequence layout built in TraitGen.input2decoder is [prompt | image | text]
+        prompt_weights = torch.zeros(batch_size, prompt_len, device=device)
+        image_weights = torch.zeros(batch_size, image_len, device=device)
 
         text_weights = torch.full(
             (batch_size, text_len),
@@ -110,16 +100,20 @@ class GPT2Decoder(nn.Module):
             device=device,
         )
 
-        eos_mask = (labels == self.tokenizer.eos_token_id)[:,image_len+prompt_len:,]
-        text_weights[species_mask] = SPECIES_TOKEN_WEIGHT
-        
+        # FIX: species_mask is a 0/1 long tensor. It MUST be converted to bool,
+        # otherwise PyTorch treats it as integer indices (rows 0/1), which
+        # up-weights whole samples and goes out of bounds when batch size == 1.
+        species_mask = species_mask.to(device=device).bool()
 
+        eos_mask = (labels == self.tokenizer.eos_token_id)[:, image_len + prompt_len:]
+
+        text_weights[species_mask] = SPECIES_TOKEN_WEIGHT
         text_weights[eos_mask] = EOS_TOKEN_WEIGHT
 
         weights = torch.cat(
             [
-                image_weights,
                 prompt_weights,
+                image_weights,
                 text_weights,
             ],
             dim=1,
@@ -132,12 +126,10 @@ class GPT2Decoder(nn.Module):
             shift_labels.reshape(-1),
             reduction="none",
         ).view_as(shift_labels)
-        #print(image_len,prompt_len,text_len)
-        #print(labels.shape)
-        #print(loss.shape)
-        #print(shift_weights.shape)
+
         loss = loss * shift_weights
 
         mask = shift_labels != -100
 
-        return outputs,loss[mask].sum() / shift_weights[mask].sum()
+        denom = shift_weights[mask].sum().clamp_min(1e-8)
+        return outputs, loss[mask].sum() / denom
